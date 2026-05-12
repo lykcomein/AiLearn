@@ -1,0 +1,17 @@
+# ===== Simple Agent 直接依赖 =====
+# 安装命令：pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+# 锁定主版本，允许小版本升级；如需严格复现请用 pip freeze > requirements-lock.txt
+
+# --- LLM 客户端（必需）---
+openai>=1.50,<3.0          # OpenAI 兼容客户端，支持 DeepSeek/通义/智谱 等
+python-dotenv>=1.0,<2.0    # 加载 .env 配置
+
+# --- Web 服务（运行 web 模式时需要）---
+fastapi>=0.110,<1.0        # Web 框架
+uvicorn[standard]>=0.27,<1.0  # ASGI 服务器（standard 含 watchfiles/websockets/httptools）
+
+# --- 长期记忆（可选；ENABLE_LONG_TERM=1 才用得到）---
+chromadb>=0.5,<2.0         # 向量数据库
+
+# --- 生产部署可选 ---
+# gunicorn>=21.0,<24.0     # 多 worker 进程管理（systemd/Docker 部署时启用）
