@@ -619,21 +619,944 @@ uvicorn web.server:app --host 0.0.0.0 --port 8000 --reload
   CMD ["uvicorn", "web.server:app", "--host", "0.0.0.0", "--port", "8000"]
   ```
 
-## 七、部署
-- 本地：`python agent.py`
-- 服务：FastAPI + Uvicorn + Docker
-- 云：Vercel / Railway / 自建服务器
+## 七、部署到生产
 
-## 八、常见问题
-| 问题 | 解决方案 |
-|------|---------|
-| 工具调用死循环 | 设置 `max_iterations` |
-| Token 超限 | 截断历史或摘要压缩 |
-| 回答不准 | 优化 prompt、增加示例 |
+提供两种主流方案：
+
+- **方案 A：裸机 + systemd + Nginx + HTTPS** —— 最轻量、资源占用最低，适合 1~2 核 ECS
+- **方案 B：Docker / docker-compose** —— 最易迁移、版本回滚方便，适合多服务编排
+
+两种方案最终效果一致：浏览器访问 `https://yourdomain.com` 即可使用 Agent。**没有强偏好就选方案 B**，可移植性最好。
+
+### 7.1 服务器选型与初始化
+
+**最低配置**：1 核 1G、20G 系统盘、Linux（Ubuntu 22.04 / Debian 12 / CentOS Stream 9 均可）。
+**推荐配置**：2 核 2G，便于并发 LLM 调用。
+
+**安全组放行端口**：
+
+| 端口 | 用途 | 必须 |
+|---|---|---|
+| 22 | SSH | ✅ |
+| 80 | HTTP（Let's Encrypt 验证） | ✅ |
+| 443 | HTTPS | ✅ |
+| 8000 | 应用直连（仅调试，生产可不开） | ❌ |
+
+**首次登录后基础加固**：
+```bash
+# 1. 更新系统
+sudo apt update && sudo apt upgrade -y     # Ubuntu/Debian
+
+# 2. 创建非 root 部署用户
+sudo adduser deploy
+sudo usermod -aG sudo deploy
+sudo su - deploy
+
+# 3. 配置 SSH 公钥免密（在本地执行）
+# ssh-copy-id deploy@your.server.ip
+
+# 4. 防火墙
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+```
+
+### 7.2 域名与 DNS
+
+1. 在域名服务商（阿里云、Cloudflare 等）添加 A 记录：`agent.yourdomain.com → 服务器公网 IP`
+2. 等待 DNS 生效，用 `ping agent.yourdomain.com` 确认能解析到服务器 IP
+
+> 没域名也能跑，只是无法签发 HTTPS，可先用 `http://公网IP:8000` 临时访问。
+
+### 7.3 方案 A：裸机 + systemd + Nginx + HTTPS
+
+#### Step A1：上传代码与装依赖
+
+```bash
+git clone https://your-git-repo/simple-agent.git
+cd simple-agent
+sudo apt install -y python3 python3-venv python3-pip
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+# 生产环境额外装 gunicorn 做进程管理
+pip install "uvicorn[standard]" gunicorn
+```
+
+#### Step A2：写生产 `.env`
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+生产建议内容：
+```bash
+LLM_API_KEY=sk-xxx
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_MODEL=deepseek-chat
+LLM_TIMEOUT=60
+LLM_MAX_RETRIES=3
+
+ENABLE_SESSION_STORE=1
+SESSION_DB_PATH=/home/deploy/simple-agent/data/sessions.db
+
+ENABLE_LONG_TERM=1
+LONG_TERM_DIR=/home/deploy/simple-agent/data/chroma_store
+EMBED_PROVIDER=hash
+
+MAX_STEPS=8
+TOOL_PARALLEL=1
+```
+
+```bash
+mkdir -p /home/deploy/simple-agent/data
+```
+
+#### Step A3：systemd 守护进程
+
+新建 `/etc/systemd/system/simple-agent.service`：
+```ini
+[Unit]
+Description=Simple Agent Web Service
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/simple-agent
+EnvironmentFile=/home/deploy/simple-agent/.env
+ExecStart=/home/deploy/simple-agent/.venv/bin/gunicorn \
+    -k uvicorn.workers.UvicornWorker \
+    -w 2 \
+    -b 127.0.0.1:8000 \
+    --timeout 120 \
+    --access-logfile - \
+    --error-logfile - \
+    web.server:app
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/simple-agent.log
+StandardError=append:/var/log/simple-agent.err.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> `-w 2` = 2 个 worker 进程；CPU 越多可加大，但 SQLite 多进程下锁更频繁，建议 ≤4 或换 Postgres。
+
+启动：
+```bash
+sudo touch /var/log/simple-agent.log /var/log/simple-agent.err.log
+sudo chown deploy:deploy /var/log/simple-agent.*
+sudo systemctl daemon-reload
+sudo systemctl enable --now simple-agent
+sudo systemctl status simple-agent      # 应看到 active (running)
+```
+
+常用命令：
+```bash
+sudo systemctl restart simple-agent     # 重启
+sudo journalctl -u simple-agent -f      # 实时日志
+```
+
+#### Step A4：Nginx 反向代理 + HTTPS
+
+```bash
+sudo apt install -y nginx certbot python3-certbot-nginx
+```
+
+新建 `/etc/nginx/sites-available/simple-agent`：
+```nginx
+server {
+    listen 80;
+    server_name agent.yourdomain.com;
+
+    # 客户端最大请求体（避免长 prompt 被拦截）
+    client_max_body_size 10M;
+
+    # SSE 流式必需配置：禁用缓冲、长连接
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+    }
+}
+```
+
+启用并签发 HTTPS：
+```bash
+sudo ln -s /etc/nginx/sites-available/simple-agent /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d agent.yourdomain.com \
+    --agree-tos -m you@example.com --no-eff-email --redirect
+```
+
+certbot 会自动签发证书 + 改写 nginx 配置 + 配置 80→443 跳转 + 安装 cron 自动续签（90 天）。
+
+#### Step A5：发布更新
+
+```bash
+cd /home/deploy/simple-agent
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart simple-agent
+```
+
+### 7.4 方案 B：Docker / docker-compose
+
+#### Step B1：装 Docker
+
+**Linux**：
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER && newgrp docker
+sudo systemctl enable --now docker
+```
+
+**macOS**：装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)；公司电脑因 License 限制可用开源替代 Colima：
+```bash
+brew install colima docker docker-compose docker-buildx
+colima start --cpu 4 --memory 8 --disk 60
+# 国内网络需换 DNS 与镜像加速器
+```
+
+**Windows**：先 `wsl --install` 启用 WSL2，再装 Docker Desktop（勾选 *Use WSL 2*）。
+
+验证：`docker run --rm hello-world`。
+
+#### Step B2：Dockerfile
+
+```dockerfile
+FROM python:3.13-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    && pip install --no-cache-dir "uvicorn[standard]" gunicorn
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", \
+     "-w", "2", "-b", "0.0.0.0:8000", "--timeout", "120", \
+     "web.server:app"]
+```
+
+`.dockerignore`：
+```
+.venv
+__pycache__
+*.pyc
+.env
+sessions.db
+chroma_store
+.git
+tests
+```
+
+> **关键技巧**：`COPY requirements.txt` 单独一步在 `pip install` **之前**，可以让 Docker 缓存依赖层——改业务代码时不用重装依赖，构建从几分钟降到几秒。
+
+#### Step B3：docker-compose.yml
+
+```yaml
+services:
+  agent:
+    build: .
+    container_name: simple-agent
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"   # 只允许 Nginx 访问，不直接对公网
+    volumes:
+      - ./data/sessions.db:/app/sessions.db
+      - ./data/chroma_store:/app/chroma_store
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  nginx:
+    image: nginx:alpine
+    container_name: simple-agent-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certbot/conf:/etc/letsencrypt:ro
+      - ./deploy/certbot/www:/var/www/certbot:ro
+    depends_on:
+      - agent
+```
+
+#### Step B4：HTTPS 证书 + 启动
+
+```bash
+mkdir -p deploy/certbot/conf deploy/certbot/www data
+
+# 临时用 standalone 签发
+docker run --rm \
+  -v $(pwd)/deploy/certbot/conf:/etc/letsencrypt \
+  -v $(pwd)/deploy/certbot/www:/var/www/certbot \
+  -p 80:80 \
+  certbot/certbot certonly --standalone \
+    -d agent.yourdomain.com \
+    --agree-tos -m you@example.com --no-eff-email -n
+
+# 启动完整服务
+docker compose up -d --build
+docker compose logs -f
+```
+
+证书自动续签（cron 每月 1 号 3 点）：
+```bash
+0 3 1 * * cd /home/deploy/simple-agent && docker run --rm \
+  -v $(pwd)/deploy/certbot/conf:/etc/letsencrypt \
+  -v $(pwd)/deploy/certbot/www:/var/www/certbot \
+  certbot/certbot renew --quiet && \
+  docker compose exec nginx nginx -s reload
+```
+
+#### Step B5：发布更新
+
+```bash
+cd /home/deploy/simple-agent
+git pull
+docker compose up -d --build
+docker image prune -f
+```
+
+### 7.5 监控、备份、排错
+
+**健康检查**：
+```bash
+curl https://agent.yourdomain.com/api/health
+```
+接入 UptimeRobot / 云监控，3 分钟探测一次，挂了自动告警。
+
+**日志查看**：
+
+| 部署方式 | 命令 |
+|---|---|
+| systemd | `sudo journalctl -u simple-agent -f` |
+| Docker | `docker compose logs -f agent` |
+| Nginx | `tail -f /var/log/nginx/{access,error}.log` |
+
+**数据备份**（每天凌晨 2 点）：
+```bash
+crontab -e
+0 2 * * * cd /home/deploy/simple-agent && tar -czf /backup/agent-$(date +\%F).tar.gz data/
+```
+
+**常见线上问题**：
+
+| 现象 | 排查 |
+|---|---|
+| 502 Bad Gateway | 应用没起来：`systemctl status` 或 `docker compose ps` |
+| SSE 流式断流 | Nginx 漏配 `proxy_buffering off`；或经过带缓冲 CDN |
+| 502 + 长 prompt | `proxy_read_timeout` 调到 300s |
+| HTTPS 证书过期 | `sudo certbot renew --dry-run` 检查续签 |
+| `database is locked` | worker 数过多抢 SQLite，降到 1 或迁 Postgres |
+| 内存 OOM | chromadb 向量过多，定期清理或换轻量 embedding |
+
+**安全加固清单**：
+- ✅ 关闭 8000 端口对公网暴露，只允许 Nginx 访问
+- ✅ `chmod 600 .env`，仅 deploy 用户可读
+- ✅ `.env` / `sessions.db` / `chroma_store` 不提交 git
+- ✅ 内部系统加 IP 白名单或 Basic Auth
+- ✅ `fail2ban` 防 SSH 爆破
+- ✅ LLM API Key 设配额告警
+
+**部署方案对比**：
+
+| 维度 | 方案 A systemd | 方案 B Docker |
+|---|---|---|
+| 学习成本 | 需懂 systemd / Nginx | 需懂 Docker |
+| 资源占用 | 最低 | 额外 100MB 左右 |
+| 迁移难度 | 中（要重装依赖） | 低（镜像即走） |
+| 回滚 | `git checkout` + 重启 | `docker compose` 切 tag |
+| 适合场景 | 单机、长期运行 | 多环境、CI/CD |
 
 ---
 
-## Todo
-### prompt优化
+## 八、常见问题与平台专项
 
-完成以上步骤，你就拥有了一个可扩展的简单 Agent！
+### 8.1 通用 FAQ
+
+**Q1：`ModuleNotFoundError: No module named 'openai'`**
+未激活虚拟环境或未装依赖：
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+```
+
+**Q2：`openai.APIConnectionError` 反复重试仍失败**
+检查 `LLM_BASE_URL` 是否可达。国内机器访问 `api.openai.com` 需代理；建议切 DeepSeek 或通义千问兼容端点。
+
+**Q3：工具调用死循环 / 一直在调工具不返回**
+设置 `MAX_STEPS=8`（默认值），单轮最多 8 步循环；同时检查 prompt 决策准则是否清晰，是否明确告诉了 LLM"工具调够了就该回答"。
+
+**Q4：Token 超限**
+- 调小 `SHORT_TERM_TURNS`（默认 10）触发自动摘要
+- 工具返回内容过长时在 `safe_call` 里截断到 N 字
+- 极端场景：把 `messages` 整体喂给 LLM 做摘要，再清空 `recent`
+
+**Q5：回答不准 / 跑偏**
+- 优化 system prompt：明确角色、约束、输出格式（参考 §6.1）
+- 给 1~2 个 few-shot 示例
+- 工具 `description` 写清楚"什么场景用"
+
+**Q6：SSE 流式返回 500 / 卡住**
+LLM key 无效 / 超时。看终端日志或调 `GET /api/health`；`.env` 改完需重启 uvicorn。
+
+**Q7：SQLite 报 `database is locked`**
+多进程写同一份 `sessions.db` 会冲突。本项目已用 `threading.Lock` 保证单进程内线程安全；跨进程请改用 Postgres。
+
+**Q8：Chroma 报 `Expected metadata to be a non-empty dict`**
+老版本 chromadb 不允许空 metadata，[`long_term.py`](simple-agent/memory/long_term.py) 已自动补 `{"_": ""}` 占位；若仍报错，升级 `pip install -U chromadb`。
+
+**Q9：测试跑不起来，提示 `attempted relative import`**
+请用 `python -m unittest discover -s tests -v`，而不是 `python tests/test_xxx.py`。前者会把项目根加入 sys.path。
+
+**Q10：如何清空长期记忆？**
+```bash
+rm -rf simple-agent/chroma_store
+# 或在代码里：
+python -c "from memory.long_term import clear_all; clear_all()"
+```
+
+### 8.2 Windows 专项
+
+#### PowerShell 脚本策略报错
+
+首次激活 venv 时如果报：
+```
+无法加载文件 ...Activate.ps1，因为在此系统上禁止运行脚本
+```
+**管理员**身份执行一次（仅需一次）：
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+#### 编码乱码（中文显示成 `??`）
+
+Windows 默认 GBK 终端遇到中文易乱码。永久解决（可写进 `$PROFILE`）：
+```powershell
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+```
+或临时切换代码页：`chcp 65001`。
+
+#### 端口 8000 被占用
+
+```powershell
+netstat -ano | findstr :8000
+taskkill /PID <pid> /F
+# 或换端口
+uvicorn web.server:app --port 8888 --reload
+```
+
+#### 路径分隔符
+
+代码里所有路径都用了 `os.path.join` / `pathlib`，无需改代码。`.env` 写路径时：
+```bash
+# ✅ 正确（正斜杠，跨平台）
+SESSION_DB_PATH=data/sessions.db
+# ✅ 也正确（双反斜杠转义）
+SESSION_DB_PATH=data\\sessions.db
+# ❌ 错误（单反斜杠会被当转义符）
+SESSION_DB_PATH=data\sessions.db
+```
+
+> **强烈建议**：Windows 用户有 WSL2 的话直接在 WSL 里按 macOS/Linux 流程跑，体验更丝滑，尤其是 chromadb 这类含 C 扩展的包。
+
+### 8.3 macOS/Linux ↔ Windows 命令对照
+
+| 操作 | macOS / Linux | Windows PowerShell |
+|---|---|---|
+| 查看 Python | `python3 --version` | `python --version` |
+| 创建 venv | `python3 -m venv .venv` | `python -m venv .venv` |
+| 激活 venv | `source .venv/bin/activate` | `.\.venv\Scripts\Activate.ps1` |
+| 退出 venv | `deactivate` | `deactivate` |
+| 复制文件 | `cp a b` | `Copy-Item a b` |
+| 删除目录 | `rm -rf dir` | `Remove-Item -Recurse -Force dir` |
+| 查看文件尾 | `tail -f log` | `Get-Content log -Wait -Tail 20` |
+| 临时环境变量 | `export KEY=value` | `$env:KEY="value"` |
+
+---
+
+## 九、配置项总览
+
+所有配置通过 `.env` / 环境变量注入，代码里均有默认值——零配置也能跑（除 `LLM_API_KEY` 必填）。
+
+### 9.1 LLM 配置
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LLM_API_KEY` | **必填** | DeepSeek / OpenAI / 其他兼容服务的 API Key |
+| `LLM_BASE_URL` | `https://api.deepseek.com/v1` | OpenAI 兼容服务的 Base URL |
+| `LLM_MODEL` | `deepseek-chat` | 模型名（如 `gpt-4o-mini`、`qwen-plus`） |
+| `LLM_TIMEOUT` | `30` | 单次请求超时（秒） |
+| `LLM_MAX_RETRIES` | `3` | 可重试错误的重试次数 |
+| `PROMPT_VERSION` | `v2` | `v1` / `v2`，对应 `prompts.py` 不同版本 |
+
+### 9.2 短期记忆
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `SHORT_TERM_TURNS` | `10` | 窗口保留轮数，超过触发摘要 |
+
+### 9.3 会话存储
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `ENABLE_SESSION_STORE` | `0` | `1` 开启 SQLite 持久化 |
+| `SESSION_DB_PATH` | `sessions.db` | 数据库文件路径 |
+
+### 9.4 长期记忆
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `ENABLE_LONG_TERM` | `0` | `1` 开启 Chroma 向量检索 |
+| `LONG_TERM_DIR` | `chroma_store` | 向量库持久化目录 |
+| `EMBED_PROVIDER` | `hash` | `hash`（离线） / `openai`（联网） |
+| `EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding 模型名 |
+| `EMBED_API_KEY` | 复用 `LLM_API_KEY` | 单独为 embedding 指定 key |
+| `EMBED_BASE_URL` | 复用 `LLM_BASE_URL` | 单独为 embedding 指定 endpoint |
+
+### 9.5 Agent 主循环
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MAX_STEPS` | `8` | 单轮对话最多执行 LLM+工具的步数，防死循环 |
+| `TOOL_PARALLEL` | `1` | `1` 开启同轮多工具并发；`0` 串行 |
+
+### 9.6 配置加载机制
+
+`agent.py` / `web/server.py` 启动时通过 `python-dotenv` 自动加载 `.env`，等价于 `os.environ.update(...)`。优先级：
+
+```
+shell 环境变量 (export)  >  .env 文件  >  代码默认值
+```
+
+部署到生产时，建议把敏感配置（如 `LLM_API_KEY`）放在 systemd `EnvironmentFile=` 或 docker `env_file:`，**不要**写进镜像。
+
+---
+
+## 十、Skill 系统（按需加载的能力包）
+
+借鉴 Claude / JoyCode 的 Skill 设计：把"领域知识 + 操作指南 + 辅助资源"打包成一个目录，Agent 在合适时机自动激活。**Skill 是开发文档中常被忽略但极重要的扩展机制**——它解决了"100 个领域知识塞不下 system prompt"的痛点。
+
+### 10.1 为什么需要 Skill？
+
+普通工具系统的瓶颈：
+
+| 方案 | 上下文占用 | 维护成本 |
+|---|---|---|
+| 把所有领域知识写进 system prompt | 几十 K tokens，token 直接爆 | 改一处全文重发 |
+| 拆成多个 system prompt 切换 | 切换逻辑硬编码，难扩展 | 加新场景要改代码 |
+| **Skill：两阶段激活** | 启动 ~50 tokens/个，运行时按需展开 | 加文件即可，零代码 |
+
+### 10.2 两阶段激活原理
+
+| 阶段 | 加载内容 | 上下文成本 |
+|---|---|---|
+| **启动时** | 仅每个 skill 的 `name + description`（约 50 tokens/个） | 极低 |
+| **运行时** | LLM 调 `activate_skill(name=...)` → 把完整 SKILL.md 正文回灌 | 按需展开 |
+
+**100 个 skill 注册进来，启动只多 5K tokens**，而不是全部塞进 system prompt。
+
+### 10.3 目录结构
+
+```
+simple-agent/
+├── skills/
+│   ├── csv-analyzer/                     ← 一个 skill = 一个目录
+│   │   ├── SKILL.md                      ← 必需：入口说明（含 frontmatter）
+│   │   └── references/
+│   │       └── pandas-cheatsheet.md      ← 可选：参考资料
+│   └── sql-formatter/
+│       └── SKILL.md
+└── skill_loader.py                       ← 扫描器
+```
+
+### 10.4 SKILL.md 格式
+
+frontmatter（YAML 风格）+ Markdown 正文：
+
+```markdown
+---
+name: csv-analyzer
+description: 当用户需要分析 CSV 文件、统计数据分布、查找异常值时使用。触发词：CSV、表格、统计、分组。
+---
+
+# CSV 分析技能
+
+## 何时使用
+- 用户明确提到 CSV
+- 需要计算均值、分位数...
+
+## 操作流程
+1. 先读取前 100 行确认结构
+2. ...
+
+## 输出规范
+- 先结论后数据
+- 异常必须高亮
+```
+
+**字段说明**：
+- `name`（必需）：skill 唯一标识，对应 `activate_skill(name=...)` 的参数
+- `description`（必需）：**写清楚什么场景下用**，这是 LLM 决定要不要激活的唯一依据
+- 正文：详细的 how-to，会在激活时整段塞进上下文
+
+### 10.5 核心实现要点
+
+**扫描器 `skill_loader.py`**：
+```python
+@dataclass
+class SkillMeta:
+    name: str
+    description: str
+    path: str  # SKILL.md 绝对路径
+
+def load_skills(skills_dir: str | None = None) -> dict[str, SkillMeta]:
+    """扫描 skills_dir 下所有子目录，读取 SKILL.md 的 frontmatter。"""
+    index = {}
+    for entry in sorted(os.listdir(skills_dir)):
+        skill_md = os.path.join(skills_dir, entry, "SKILL.md")
+        if not os.path.isfile(skill_md):
+            continue
+        with open(skill_md, "r", encoding="utf-8") as f:
+            content = f.read()
+        meta, _ = _parse_frontmatter(content)
+        name = meta.get("name") or entry  # 没写 name 用目录名兜底
+        index[name] = SkillMeta(name, meta.get("description", ""), skill_md)
+    return index
+
+def activate_skill(name: str) -> str:
+    """激活：返回 SKILL.md 完整正文。找不到时返回错误提示字符串，不抛异常。"""
+    meta = load_skills().get(name)
+    if not meta:
+        return f"[skill 未找到] 当前可用：{', '.join(load_skills().keys())}"
+    with open(meta.path, "r", encoding="utf-8") as f:
+        _, body = _parse_frontmatter(f.read())
+    return body.strip() or "[skill 正文为空]"
+```
+
+**注入 system prompt（`prompts.py`）**：
+```python
+from skill_loader import load_skills, build_skill_index_prompt
+
+def _build_v2_with_skills() -> str:
+    skill_index = build_skill_index_prompt(load_skills())
+    if not skill_index:
+        return _SYSTEM_V2_BASE
+    return _SYSTEM_V2_BASE + "\n## 可用 skills\n" + skill_index + "\n"
+
+SYSTEM_V2 = _build_v2_with_skills()  # 启动时构建一次
+```
+
+**注册为工具（`tools.py`）**：
+```python
+from skill_loader import activate_skill as _activate_skill
+
+def activate_skill(name: str) -> str:
+    return _activate_skill(name)
+
+TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "activate_skill",
+        "description": "加载某个 skill 的详细操作指令。当任务匹配某个 skill 描述时，先调此函数取得详细指令再执行。",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
+})
+TOOL_MAP["activate_skill"] = activate_skill
+```
+
+### 10.6 工作流程示例
+
+用户问：「帮我分析一下 sales.csv 的数据分布」
+
+```
+轮 1：
+  system: "...可用 skills: csv-analyzer / sql-formatter..."
+  user:   "帮我分析一下 sales.csv 的数据分布"
+  LLM 决策 → 调 activate_skill(name="csv-analyzer")
+  工具返回 → CSV 分析技能的完整 SKILL.md 正文
+
+轮 2：
+  LLM 拿到详细指令 → 按 "Step 1: 探查数据结构" 行动
+  调 read_file("sales.csv") 或反问用户路径
+  ...
+```
+
+### 10.7 添加一个新 Skill（3 步）
+
+```bash
+# Step 1：建目录与 SKILL.md
+mkdir -p skills/my-skill
+cat > skills/my-skill/SKILL.md <<'EOF'
+---
+name: my-skill
+description: 当用户 XXX 时使用此技能...
+---
+# My Skill 详细说明
+（操作步骤）
+EOF
+
+# Step 2：热刷新（或重启服务）
+python -c "from prompts import refresh_skills; refresh_skills()"
+
+# Step 3：验证已被识别
+python -c "from skill_loader import load_skills; print(list(load_skills().keys()))"
+# 应输出：['csv-analyzer', 'my-skill', 'sql-formatter']
+```
+
+无需改任何 Python 代码——**纯文件驱动**。
+
+### 10.8 与工具系统的关系
+
+| 维度 | Tool（工具） | Skill（技能） |
+|---|---|---|
+| 形态 | Python 函数 + JSON Schema | Markdown 文件 |
+| 注册方式 | 改 `tools.py` 的 `TOOLS` / `TOOL_MAP` | 加文件即可 |
+| 作用 | 执行确定动作（计算、查时间、调 API） | 提供方法论、操作流程、约束 |
+| 何时用 | 需要"做事" | 需要"按某种方式做事" |
+| 上下文占用 | Schema 常驻 | 仅激活时塞入 |
+
+**两者协作**：skill 在正文里告诉 LLM「先调 tool A，再调 tool B」，把工具的串联策略文档化。
+
+### 10.9 最佳实践
+
+- **description 写"何时使用"，不要写"是什么"**——LLM 看的是触发条件
+  - ❌ `description: 一个 SQL 工具`
+  - ✅ `description: 当用户需要格式化或美化 SQL 语句时使用`
+- **正文给可执行步骤**：写"按步操作"而不是"理论介绍"
+- **明确"禁止事项"**：列 "不要把超过 20 行原始数据贴出来"、"不要修改用户文件" 等约束
+- **References 资料按需引**：体积大的速查表/规范放 `references/` 子目录，正文中只提"必要时查 X"
+- **粒度别太细**：一个 skill 解决一类问题就够，过细会让 LLM 选择困难
+
+### 10.10 排错
+
+| 现象 | 原因 |
+|---|---|
+| Agent 完全不调用 activate_skill | description 写得太抽象，LLM 识别不到匹配场景 |
+| 调用了但报"skill 未找到" | name 不一致，检查 SKILL.md 里 `name:` 字段和目录名 |
+| 启动时 system prompt 没有 skill 列表 | `skills/` 目录路径不对，或 SKILL.md 缺 frontmatter |
+| 修改了 SKILL.md 不生效 | 缓存：`prompts.CURRENT` 只在启动时构建一次，需调 `refresh_skills()` 或重启 |
+
+---
+
+## 十一、扩展指南
+
+### 11.1 新增一个工具（3 步）
+
+以「获取天气」为例：
+
+**Step 1**：在 `tools.py` 实现函数
+```python
+def get_weather(city: str) -> str:
+    # 真实场景调用气象 API，这里 mock
+    return f"{city} 今天多云 22℃"
+```
+
+**Step 2**：在 `TOOLS` 列表追加 schema
+```python
+{
+  "type": "function",
+  "function": {
+    "name": "get_weather",
+    "description": "查询指定城市的当日天气",
+    "parameters": {
+      "type": "object",
+      "properties": {"city": {"type": "string", "description": "城市名"}},
+      "required": ["city"],
+    },
+  },
+}
+```
+
+**Step 3**：在 `TOOL_MAP` 注册
+```python
+TOOL_MAP = {
+    "calculator": calculator,
+    "get_current_time": get_current_time,
+    "get_weather": get_weather,   # 新增
+}
+```
+
+重启服务即可，LLM 自动感知新工具。建议同步在 `prompts.py` 的"可用工具"列表里加一行，并补一个 `test_` 单测。
+
+### 11.2 切换 LLM 服务商
+
+只需改 `.env` 三项，无需改代码：
+```bash
+# 切到 OpenAI
+LLM_API_KEY=sk-xxx
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+
+# 切到阿里云 DashScope（OpenAI 兼容模式）
+LLM_API_KEY=sk-xxx
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL=qwen-plus
+
+# 切到自部署 vLLM
+LLM_API_KEY=any-token
+LLM_BASE_URL=http://your-vllm-host:8000/v1
+LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+```
+
+### 11.3 替换记忆实现
+
+所有记忆模块都是"接口 + 实现"分离，方法签名保持不变即可平替：
+
+- **短期记忆**：替换 `short_term.py` 的 `build()` 返回 messages 列表，例如改用 LLM 压缩 + 关键词提取
+- **会话存储**：把 `session_store.py` 的 SQLite 换成 Postgres / Redis，保持 `append/load/list/delete` 不变
+- **长期记忆**：把 `long_term.py` 的 Chroma 换成 Qdrant / Milvus / Pgvector，保持 `remember/recall/forget` 不变
+
+### 11.4 接入 Prompt 版本管理
+
+`prompts.py` 已支持多版本：
+```python
+SYSTEM_V3 = """你是 ... (新 prompt)"""
+
+def get_prompt(version: str = "current") -> str:
+    return {"v1": SYSTEM_V1, "v2": SYSTEM_V2, "v3": SYSTEM_V3,
+            "current": CURRENT}.get(version, CURRENT)
+```
+运行前 `export PROMPT_VERSION=v3` 即可灰度。
+
+### 11.5 接入真·token 流式
+
+把 `llm.py` 的 `chat_stream` 改成 `stream=True`，按 delta 推 SSE：
+```python
+def chat_stream(messages, tools=None):
+    return client.chat.completions.create(
+        model=MODEL, messages=messages, tools=tools, stream=True,
+    )
+
+# server.py 里
+async for chunk in chat_stream(...):
+    delta = chunk.choices[0].delta.content or ""
+    yield f"data: {json.dumps({'type':'delta','text':delta})}\n\n"
+```
+前端收 `delta` 事件直接 append 到 DOM，体验更丝滑。
+
+### 11.6 接入 RAG 知识库
+
+利用现成的长期记忆模块即可：
+```python
+from memory.long_term import remember
+
+# 一次性导入文档
+for chunk in split_document(open("knowledge.txt").read(), size=500):
+    remember(chunk, meta={"source": "knowledge.txt"})
+
+# Agent 主循环里已经会自动 recall，无需额外改动
+```
+
+### 11.7 多用户与权限
+
+生产场景给请求加鉴权：
+```python
+from fastapi import Depends, HTTPException, Header
+
+async def auth(x_api_key: str = Header(...)):
+    if x_api_key != os.environ["INTERNAL_API_KEY"]:
+        raise HTTPException(401, "invalid key")
+
+@app.post("/api/chat", dependencies=[Depends(auth)])
+async def chat(...):
+    ...
+```
+
+同时 `session_id` 加上用户前缀做数据隔离：`session_id = f"{user_id}-{client_session_id}"`。
+
+---
+
+## 十二、项目结构速览
+
+```
+simple-agent/
+├── agent.py                 # CLI 入口 + Agent 主循环
+├── llm.py                   # LLM 客户端 + 重试封装
+├── prompts.py               # System prompt + 版本管理 + skill 索引注入
+├── tools.py                 # 工具实现 + Schema + safe_call
+├── skill_loader.py          # Skill 扫描与激活
+│
+├── memory/                  # 三层记忆模块
+│   ├── short_term.py        # 短期记忆（窗口 + 摘要）
+│   ├── session_store.py     # SQLite 会话持久化
+│   └── long_term.py         # Chroma 长期向量记忆
+│
+├── web/                     # FastAPI Web 服务
+│   ├── server.py            # HTTP/SSE 接口
+│   └── static/index.html    # 单文件聊天 UI
+│
+├── skills/                  # Skill 目录（每子目录一个 SKILL.md）
+│
+├── tests/                   # 单测套件（完全离线，<200ms）
+│
+├── .env / .env.example      # 配置（前者不入库）
+├── sessions.db              # SQLite 数据（运行时生成）
+├── chroma_store/            # 向量库目录（启用 LONG_TERM ���生成）
+└── .venv/                   # Python 虚拟环境
+```
+
+**核心能力对照**：
+
+| 能力 | 实现位置 | 关键点 |
+|---|---|---|
+| 多轮对话 | `agent.py` | LLM ↔ 工具循环，最多 `MAX_STEPS` 防死循环 |
+| 工具调用 | `tools.py` + LLM `tools` 字段 | 函数 + JSON Schema 双声明，`TOOL_MAP` 映射 |
+| 并发执行工具 | `agent.py:_execute_tools_parallel` | `ThreadPoolExecutor`，单工具不开线程 |
+| LLM 重试 | `llm.py:chat_with_retry` | 指数退避 1s→2s→4s + jitter，仅重试网络/限流/5xx |
+| 异常隔离 | `tools.py:safe_call` | 工具抛异常转字符串，回灌 LLM 自我纠错 |
+| 短期记忆 | `memory/short_term.py` | 窗口 + 自动摘要压缩，避免 token 爆炸 |
+| 会话持久化 | `memory/session_store.py` | SQLite，按 `session_id` 存取，跨重启恢复 |
+| 长期向量记忆 | `memory/long_term.py` | Chroma，按需召回 + 启发式写入 |
+| Skill 系统 | `skill_loader.py` + `prompts.py` | 两阶段激活：启动注册索引，运行时加载正文 |
+| Prompt 版本 | `prompts.py` | `v1`/`v2`/`current`，便于 A/B 测试 |
+| Web API | `web/server.py` | REST + SSE，多会话隔离 |
+
+---
+
+完成以上步骤，你就拥有了一个**可扩展、可观测、能上线**的智能 Agent：
+
+- ✅ 工具调用 + 三层记忆 + Skill 按需加载
+- ✅ 错误重试 + 异常兜底 + 并发执行
+- ✅ CLI / Web / Python 库三种使用形态
+- ✅ systemd / Docker 两套生产部署方案
+- ✅ 完全离线的测试套件保障迭代质量
+
+**少即是多，看得懂才改得动**——这正是 Simple Agent 的本意。
