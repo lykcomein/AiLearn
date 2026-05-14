@@ -1560,3 +1560,161 @@ simple-agent/
 - ✅ 完全离线的测试套件保障迭代质量
 
 **少即是多，看得懂才改得动**——这正是 Simple Agent 的本意。
+
+---
+
+## 十三、完整 LLM 系统建设路线图（开发 Todo）
+
+> 把"做一个完整 LLM 系统"拆成 **10 个里程碑、30 项 Todo**，按"先骨架 → 再能力 → 再生产 → 再运营"顺序推进。每项都对应本文档前面的某个章节，做完即可上线。
+
+### 13.1 全景视图
+
+| 里程碑 | 任务数 | 产出 | 对应章节 |
+|---|---|---|---|
+| **M1 骨架** | 5 | 最小可运行 CLI Agent | §五 Step 1-3 / §9.1 |
+| **M2 记忆** | 4 | 三层记忆接入主循环 | §五 Step 4 / §9.2-9.4 |
+| **M3 Skill** | 3 | 按需加载的能力包 | §十 |
+| **M4 接口** | 3 | Web UI + SSE 流式 | §6.5 |
+| **M5 测试** | 2 | 离线测试 + CI | §五 Step 5 |
+| **M6 部署** | 3 | systemd / Docker 上线 | §七 |
+| **M7 安全** | 2 | 密钥/网络/防火墙 | §7.5 |
+| **M8 观测** | 3 | 日志/告警/备份 | §7.5 |
+| **M9 进阶** | 4 | RAG / 多租户 / A/B / 性能 | §十一 |
+| **M10 文档** | 1 | README + runbook + 排错手册 | —— |
+
+### 13.2 详细 Todo 清单
+
+#### 🏗️ M1 — 骨架（最小可运行 Agent）
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 1 | `llm.py` | 封装 OpenAI 兼容 SDK + `chat_with_retry` 指数退避（仅重试 5xx/超时/限流） |
+| 2 | `tools.py` | 3 个内置工具 + JSON Schema + `TOOL_MAP` + `safe_call` 异常兜底 |
+| 3 | `agent.py` 主循环 | `MAX_STEPS` 防死循环 + 工具并发 + LLM 失败兜底 |
+| 4 | `prompts.py` | v1/v2 + `get_prompt` + 五要素 system prompt |
+| 5 | `.env.example` | 配置模板 + `python-dotenv` 自动加载 |
+
+**完成标志**：`python agent.py` 能多轮对话、能调用工具、出错不崩。
+
+#### 🧠 M2 — 三层记忆
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 6 | `memory/short_term.py` | 窗口 + 自动摘要压缩，避免 token 爆 |
+| 7 | `memory/session_store.py` | SQLite 持久化 + 线程锁 |
+| 8 | `memory/long_term.py` | Chroma 向量召回 + hash/openai 双 embedding |
+| 9 | `agent.py` 接入三层记忆 | 召回到 system 消息、写入启发式策略 |
+
+**完成标志**：重启进程后历史对话还在；问到上次提过的事能召回。
+
+#### 🎯 M3 — Skill 系统
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 10 | `skill_loader.py` | 扫描 `SKILL.md` + frontmatter 解析 |
+| 11 | 注册 `activate_skill` 工具 | + `prompts.py` 注入 skill 索引 |
+| 12 | 至少建 2 个 SKILL.md | 验证两阶段激活流程（启动注册索引 / 运行时加载正文） |
+
+**完成标志**：100 个 skill 注册启动只多 ~5K tokens；触发词命中时 LLM 自动激活。
+
+#### 🌐 M4 — 接口层
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 13 | `web/server.py` | FastAPI + REST `/api/chat` + SSE `/api/chat/stream` + 多会话隔离 |
+| 14 | `web/static/index.html` | 单文件聊天 UI（Markdown / 代码高亮 / 抽屉响应式） |
+| 15 | 真·token 流 | `llm.stream=True` + `delta` SSE 事件 |
+
+**完成标志**：浏览器有 ChatGPT 风格的可用 UI，支持 Markdown、代码高亮、流式打字。
+
+#### ✅ M5 — 测试与 CI
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 16 | `tests/` 完整套件 | mock LLM + 临时 SQLite + hash embedding，**完全离线** |
+| 17 | CI 跑测试 + 覆盖率 | GitHub Actions / GitLab CI，每次 PR 自动跑 |
+
+**完成标志**：测试 < 200ms 跑完，无任何外部依赖；红绿灯保护主分支。
+
+#### 🚀 M6 — 部署到生产
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 18 | Docker | `Dockerfile` + `.dockerignore` + `docker-compose.yml` |
+| 19 | systemd 方案 | systemd 单元 + Nginx 反向代理（**SSE 必须关缓冲**）+ certbot HTTPS |
+| 20 | 运维支持 | 证书自动续签 cron + 数据卷挂载 + healthcheck |
+
+**完成标志**：`https://yourdomain.com` 可访问，证书自动续，挂了能自启。
+
+#### 🔒 M7 — 安全加固
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 21 | 密钥与端口 | `.env` 权限 600 + 8000 仅内网 + API Key 鉴权 + LLM 配额告警 |
+| 22 | 系统安全 | `fail2ban` 防 SSH 爆破 + `ufw` 防火墙 + 定期 `apt upgrade` |
+
+#### 👀 M8 — 观测与运维
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 23 | 结构化日志 | access/error 分文件 + `journalctl` 收集 |
+| 24 | 健康检查 + 告警 | `/api/health` + UptimeRobot / 云监控 3 分钟探测 |
+| 25 | 数据备份 | cron 定时打包 + 回滚脚本 |
+
+#### ⚡ M9 — 进阶能力
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 26 | RAG 知识库 | 文档分段 → `remember()` 批量导入 → `recall()` 调优 |
+| 27 | 多用户与权限 | `session_id` 加用户前缀 + `Depends()` 鉴权 |
+| 28 | Prompt A/B | `PROMPT_VERSION` 灰度 + 指标对比 |
+| 29 | 性能扩容 | worker 数 = 2*CPU+1 / SQLite→Postgres / Chroma→Qdrant |
+
+#### 📚 M10 — 文档
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 30 | 文档体系 | README + 开发指南 + 部署 runbook + 排错手册 |
+
+### 13.3 建议执行节奏
+
+| 阶段 | 时长 | 完成内容 |
+|---|---|---|
+| **第 1 周** | M1 + M2 | 一个能记忆、能调工具的 CLI Agent |
+| **第 2 周** | M3 + M4 + M5 | 带 Web UI、Skill 可扩展、测试保护 |
+| **第 3 周** | M6 + M7 + M8 | 上线生产，监控告警齐全 |
+| **第 4 周+** | M9 + M10 | 持续优化，文档沉淀 |
+
+### 13.4 两个关键决策点（动手前先定）
+
+**1. 存储栈选型**
+
+| 场景 | 推荐组合 | 理由 |
+|---|---|---|
+| 单机 / 个人项目 | SQLite + Chroma | 零依赖、免运维 |
+| 多实例 / 生产 | Postgres + Qdrant | 直接选用，避免后期迁移 |
+
+**2. LLM 服务商选型**
+
+| 场景 | 推荐 | 理由 |
+|---|---|---|
+| 国内合规 | DeepSeek / 通义千问 | 直连无墙、价格便宜 |
+| 全球流量 | OpenAI / Anthropic | 模型能力最强 |
+| 延迟敏感 / 数据敏感 | vLLM 自部署 | 同区域机房，可控可审计 |
+
+> 这两个决策影响后续所有代码与部署，**强烈建议第 1 天就敲定**，避免到 M6 才发现要重写。
+
+### 13.5 优先级与可裁剪项
+
+如果资源紧张，按以下优先级取舍：
+
+**必做**（缺一不可）：
+- M1（骨架） · M2 短期记忆 · M5 单测 · M6 部署 · M7 密钥安全
+
+**强烈建议**（生产必备）：
+- M2 会话持久化 · M4 Web UI · M6 HTTPS · M8 健康检查 + 告警
+
+**可后置**（先上线后迭代）：
+- M2 长期向量记忆 · M3 Skill · M4 真 token 流 · M9 全部 · M10 文档完善
+
+> **反模式提醒**：不要先做 M9（进阶能力）再补 M5（测试）/ M7（安全）—— 多用户场景一旦上线，回头补鉴权和测试代价巨大。
