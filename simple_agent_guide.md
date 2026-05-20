@@ -1718,3 +1718,719 @@ simple-agent/
 - M2 长期向量记忆 · M3 Skill · M4 真 token 流 · M9 全部 · M10 文档完善
 
 > **反模式提醒**：不要先做 M9（进阶能力）再补 M5（测试）/ M7（安全）—— 多用户场景一旦上线，回头补鉴权和测试代价巨大。
+
+---
+
+## 十四、RAG 系统设计（在 Simple Agent 上扩展）
+
+> 本章给出在现有 Simple Agent 架构上扩展一套**完整 RAG（Retrieval-Augmented Generation）系统**的设计方案。之所以"能扩展"，是因为 [`memory/long_term.py`](simple-agent/memory/long_term.py) 已经是一个可复用的向量存储基础设施——RAG 只是在它上面盖一层"文档处理 + 引用回显"。
+
+### 14.1 为什么这个架构适合扩展 RAG？
+
+| 现有能力 | RAG 怎么复用 |
+|---|---|
+| `long_term.py`（Chroma + embedding） | 直接复用底层 `_embed()` 和 Chroma 客户端，零重复代码 |
+| 工具系统（`tools.py` + `TOOL_MAP`） | RAG 注册为一个工具 `search_knowledge_base`，LLM 自动决定何时调 |
+| Skill 系统 | 写一个 `rag-assistant/SKILL.md` 教 LLM "查 → 看 → 引用" 的流程 |
+| `safe_call` 异常隔离 | RAG 失败不影响主对话流 |
+| Agent 主循环工具并发 | RAG 检索可与其他工具同轮并发执行 |
+| Web UI 流式 | 检索过程以"工具卡片"实时展示，含相似度与引用 |
+| 测试套件 | 用 hash embedding 离线跑，复用现有 mock 套路 |
+
+**核心思想**：把 RAG 当作 Agent 的"**外脑**"。LLM 主动选择何时查、查什么、看了再说，而不是粗暴地把检索结果硬拼到 prompt 里。
+
+### 14.2 现状 vs 完整 RAG 的差距
+
+| 能力 | 现有 `long_term.py` | 完整 RAG 还需要 |
+|---|---|---|
+| 向量存储 | ✅ Chroma | 复用 |
+| Embedding | ✅ openai / hash | 升级到 multilingual / BGE |
+| 写入接口 | ✅ `remember(text, meta)` | 加文档导入管线 |
+| 检索接口 | ✅ `recall(query, k)` | 加 chunk + rerank + 阈值 |
+| 文档分段 | ❌ | **必补** |
+| 多文档管理 | ❌（单 collection） | **必补**（每知识库一个 collection） |
+| 引用溯源 | ❌（meta 不回传） | **必补**（结果带 `source`） |
+| 相似度阈值 / Rerank | ❌ | **必补** |
+| 查询改写（HyDE / Multi-Query） | ❌ | 可选（进阶） |
+| 评估（Recall@k） | ❌ | 上线前必加 |
+
+### 14.3 目录结构（不破坏现有代码）
+
+```
+simple-agent/
+├── memory/
+│   └── long_term.py             # ← 底层向量库（不动）
+│
+├── rag/                          # ← 新增整个 RAG 子系统
+│   ├── __init__.py
+│   ├── chunker.py               # 文档分段（按 token / 句子 / 标题）
+│   ├── loaders.py               # PDF / Markdown / HTML / Word 加载
+│   ├── store.py                 # 多知识库管理（基于 Chroma collection）
+│   ├── retriever.py             # 检索 + rerank + 阈值过滤
+│   ├── pipeline.py              # 端到端：ingest_documents / query
+│   └── evaluator.py             # 评估（Recall@k / MRR / 答案命中率）
+│
+├── skills/
+│   └── rag-assistant/
+│       └── SKILL.md             # 教 LLM 何时调 search_knowledge_base
+│
+├── tools.py                      # ← 新增工具 search_knowledge_base / list_knowledge_bases
+│
+├── scripts/
+│   ├── ingest.py                # CLI：批量导入文档到知识库
+│   └── eval_rag.py              # CLI：跑评估集
+│
+└── data/                         # 原始文档与评估集
+    ├── docs/                    # 待导入的 PDF/MD/...
+    └── eval/                    # 标注问答对（jsonl）
+```
+
+**隔离原则**：
+- **RAG 知识库** 用 collection `kb_<name>`（如 `kb_product`、`kb_internal`）
+- **用户长期记忆** 还是 `agent_memory`
+- 两者**完全独立**，互不污染
+
+### 14.4 整体流程
+
+#### 离线：文档导入管线
+
+```
+文档(.pdf/.md/.docx) → loaders 解析 → chunker 分段
+                                            ↓
+                                  embedding 向量化（复用 _embed）
+                                            ↓
+                                  Chroma collection: kb_<name>
+                                  metadata: {source, page, chunk_id, ...}
+```
+
+#### 在线：检索增强问答
+
+```
+用户问 → LLM 决策："这问题需要查知识库"
+            ↓
+       调 search_knowledge_base(query, kb, k=5)
+            ↓
+   ┌────────┴────────┐
+   │  rag.retriever  │
+   │  1. embedding 检索 top 20
+   │  2. (可选) rerank 重排到 top 5
+   │  3. 阈值过滤 score < 0.3 的低质量结果
+   │  4. 拼装结构化文本（含 source 引用）
+   └────────┬────────┘
+            ↓
+       LLM 拿到片段 + 来源 → 综合回答 + 引用
+            ↓
+       前端展示答案 + 可点击的来源标记
+```
+
+### 14.5 核心模块代码
+
+#### 14.5.1 文档分段（`rag/chunker.py`）
+
+```python
+"""文档分段：按句子边界切分，保证 chunk 内语义完整 + 相邻 chunk 有重叠防割裂。"""
+from __future__ import annotations
+import re
+
+
+def chunk_text(text: str, size: int = 500, overlap: int = 50) -> list[str]:
+    """
+    按 size 字一段切分，相邻段保留 overlap 字重叠。
+    优先在句子边界切（中英文标点 + 换行），避免把一句话切两半。
+    """
+    if len(text) <= size:
+        return [text]
+
+    sentences = re.split(r'(?<=[。！？.!?\n])', text)
+    chunks: list[str] = []
+    buf = ""
+    for s in sentences:
+        if not s.strip():
+            continue
+        if len(buf) + len(s) <= size:
+            buf += s
+        else:
+            if buf:
+                chunks.append(buf.strip())
+            # 滑窗：新块带上一块的尾巴 overlap 字
+            tail = buf[-overlap:] if overlap and buf else ""
+            buf = tail + s
+    if buf.strip():
+        chunks.append(buf.strip())
+    return chunks
+
+
+def chunk_by_heading(markdown: str) -> list[tuple[str, str]]:
+    """
+    针对 Markdown：按二级标题切分，返回 [(heading, content), ...]。
+    适合技术文档、产品手册。
+    """
+    parts = re.split(r'^## ', markdown, flags=re.MULTILINE)
+    out = []
+    for part in parts[1:]:  # 跳过开头未带标题的部分
+        first_newline = part.find("\n")
+        heading = part[:first_newline].strip() if first_newline > 0 else part.strip()
+        body = part[first_newline + 1:].strip() if first_newline > 0 else ""
+        out.append((heading, body))
+    return out
+```
+
+#### 14.5.2 文档加载器（`rag/loaders.py`）
+
+```python
+"""文档加载：把 PDF / Markdown / Word / HTML 转成 (正文, 元数据)。"""
+from __future__ import annotations
+from pathlib import Path
+
+
+def load_text(path: str) -> tuple[str, dict]:
+    """统一入口，按后缀分派。返回 (text, metadata)。"""
+    p = Path(path)
+    ext = p.suffix.lower()
+    meta_base = {"source": str(p.resolve()), "filename": p.name, "ext": ext}
+
+    if ext in (".md", ".txt"):
+        text = p.read_text(encoding="utf-8")
+    elif ext == ".pdf":
+        text = _load_pdf(path)
+    elif ext == ".docx":
+        text = _load_docx(path)
+    elif ext in (".html", ".htm"):
+        text = _load_html(path)
+    else:
+        raise ValueError(f"暂不支持的格式: {ext}")
+
+    return text, meta_base
+
+
+def _load_pdf(path: str) -> str:
+    import pypdf  # pip install pypdf
+    reader = pypdf.PdfReader(path)
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def _load_docx(path: str) -> str:
+    from docx import Document  # pip install python-docx
+    doc = Document(path)
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def _load_html(path: str) -> str:
+    from bs4 import BeautifulSoup  # pip install beautifulsoup4
+    html = Path(path).read_text(encoding="utf-8")
+    soup = BeautifulSoup(html, "html.parser")
+    # 去掉脚本/样式/导航等无关元素
+    for tag in soup(["script", "style", "nav", "footer"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
+```
+
+#### 14.5.3 多知识库存储（`rag/store.py`）
+
+复用 [`memory/long_term.py`](simple-agent/memory/long_term.py) 的 `_embed`，但用独立 collection 实现"多知识库管理 + 引用元数据保留"：
+
+```python
+"""RAG 存储层：在 long_term 之上做多知识库管理。"""
+from __future__ import annotations
+import hashlib
+import os
+from typing import Optional
+
+from memory.long_term import _embed  # 复用 embedding 函数
+
+try:
+    import chromadb
+    _CHROMA_OK = True
+except ImportError:
+    _CHROMA_OK = False
+
+_collections: dict[str, object] = {}
+
+
+def _get_kb(name: str = "default"):
+    """每个知识库一个 Chroma collection。"""
+    if not _CHROMA_OK:
+        return None
+    if name in _collections:
+        return _collections[name]
+    path = os.getenv("RAG_DB_PATH") or os.getenv("LONG_TERM_DB_PATH", "./chroma_store")
+    client = chromadb.PersistentClient(path=path)
+    col = client.get_or_create_collection(f"kb_{name}")
+    _collections[name] = col
+    return col
+
+
+def ingest(text: str, meta: dict, kb: str = "default") -> Optional[str]:
+    """写入一个 chunk。返回 chunk_id（失败返回 None）。"""
+    col = _get_kb(kb)
+    if col is None or not text.strip():
+        return None
+    # 基于"来源 + 内容前 50 字"哈希，幂等写入（同一段重复导入不会膨胀）
+    raw_id = (meta.get("source", "") + text[:50]).encode("utf-8")
+    cid = "doc-" + hashlib.md5(raw_id).hexdigest()[:16]
+    safe_meta = {k: str(v) for k, v in meta.items()} or {"_": ""}
+    col.upsert(
+        documents=[text],
+        embeddings=[_embed(text)],
+        metadatas=[safe_meta],
+        ids=[cid],
+    )
+    return cid
+
+
+def search(query: str, kb: str = "default", k: int = 5,
+           min_score: float = 0.0) -> list[dict]:
+    """
+    检索 top-k。返回 [{text, source, score, metadata}, ...]，按分数降序。
+    Chroma 用距离（越小越像），转换成相似度 1 - distance 便于阈值过滤。
+    """
+    col = _get_kb(kb)
+    if col is None or not query.strip():
+        return []
+    try:
+        r = col.query(
+            query_embeddings=[_embed(query)],
+            n_results=k,
+            include=["documents", "metadatas", "distances"],
+        )
+    except Exception:
+        return []
+    docs = (r.get("documents") or [[]])[0]
+    metas = (r.get("metadatas") or [[]])[0]
+    dists = (r.get("distances") or [[]])[0]
+    results = []
+    for d, m, dist in zip(docs, metas, dists):
+        score = max(0.0, 1.0 - float(dist))
+        if score < min_score:
+            continue
+        results.append({
+            "text": d,
+            "source": (m or {}).get("source", ""),
+            "score": round(score, 3),
+            "metadata": m or {},
+        })
+    return results
+
+
+def list_kbs() -> list[str]:
+    """列出所有知识库名（去掉 kb_ 前缀）。"""
+    if not _CHROMA_OK:
+        return []
+    path = os.getenv("RAG_DB_PATH") or os.getenv("LONG_TERM_DB_PATH", "./chroma_store")
+    client = chromadb.PersistentClient(path=path)
+    return [c.name[3:] for c in client.list_collections() if c.name.startswith("kb_")]
+
+
+def delete_kb(name: str) -> bool:
+    """删除整个知识库。"""
+    if not _CHROMA_OK:
+        return False
+    path = os.getenv("RAG_DB_PATH") or os.getenv("LONG_TERM_DB_PATH", "./chroma_store")
+    client = chromadb.PersistentClient(path=path)
+    try:
+        client.delete_collection(f"kb_{name}")
+        _collections.pop(name, None)
+        return True
+    except Exception:
+        return False
+```
+
+#### 14.5.4 端到端管线（`rag/pipeline.py`）
+
+```python
+"""端到端：文档导入 + 一站式检索。"""
+from __future__ import annotations
+from .chunker import chunk_text
+from .loaders import load_text
+from .store import ingest, search
+
+
+def ingest_document(path: str, kb: str = "default",
+                    chunk_size: int = 500, overlap: int = 50) -> int:
+    """导入单个文档，返回成功写入的 chunk 数。"""
+    text, meta = load_text(path)
+    chunks = chunk_text(text, size=chunk_size, overlap=overlap)
+    count = 0
+    for i, chunk in enumerate(chunks):
+        chunk_meta = {**meta, "chunk_index": i, "chunk_total": len(chunks)}
+        if ingest(chunk, chunk_meta, kb=kb):
+            count += 1
+    return count
+
+
+def query(question: str, kb: str = "default", k: int = 5,
+          min_score: float = 0.3) -> list[dict]:
+    """对外检索接口（加阈值默认 0.3 过滤低质量结果）。"""
+    return search(question, kb=kb, k=k, min_score=min_score)
+```
+
+#### 14.5.5 注册为 Agent 工具（`tools.py` 追加）
+
+```python
+from rag.pipeline import query as _rag_query
+from rag.store import list_kbs
+
+def search_knowledge_base(query: str, kb: str = "default", k: int = 5) -> str:
+    """从知识库检索相关片段。返回结构化文本，含来源便于 LLM 引用。"""
+    hits = _rag_query(query, kb=kb, k=k, min_score=0.3)
+    if not hits:
+        return f"[知识库 {kb}] 未找到相关内容，建议换关键词或确认知识库是否已导入"
+    lines = [f"[知识库 {kb}] 找到 {len(hits)} 条相关片段："]
+    for i, h in enumerate(hits, 1):
+        lines.append(
+            f"\n【片段 {i}】来源：{h['source']} (相关度 {h['score']})\n{h['text']}"
+        )
+    return "\n".join(lines)
+
+
+def list_knowledge_bases() -> str:
+    """列出当前可用的知识库。"""
+    kbs = list_kbs()
+    return "可用知识库：" + (", ".join(kbs) if kbs else "(暂无)")
+
+
+# 追加到 TOOLS / TOOL_MAP
+TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge_base",
+            "description": "从企业内部知识库检索相关内容。当用户问到产品文档、规章制度、技术手册等内部资料时使用。返回带来源的片段，必须在回答中引用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "检索关键词或问句，越具体越好"},
+                    "kb": {"type": "string", "description": "知识库名，默认 default"},
+                    "k": {"type": "integer", "description": "返回片段数，默认 5", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_knowledge_bases",
+            "description": "列出所有可用知识库名称。当不确定该查哪个 kb 时使用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+])
+TOOL_MAP["search_knowledge_base"] = search_knowledge_base
+TOOL_MAP["list_knowledge_bases"] = list_knowledge_bases
+```
+
+#### 14.5.6 教 LLM 怎么用（`skills/rag-assistant/SKILL.md`）
+
+```markdown
+---
+name: rag-assistant
+description: 当用户询问任何关于产品、内部规章、技术文档、企业知识库的问题时使用此技能。触发词：我们的产品、公司规定、操作手册、API 文档、xxx 怎么用。
+---
+
+# RAG 助手技能
+
+## 何时使用
+- 用户问任何"我们"、"公司"、"内部"、"产品"相关的问题
+- 用户问具体的 API、配置、流程
+- 用户问的事实型问题不在你已知范围内
+
+## 操作流程
+1. **先选库**：如果不清楚有哪些知识库，先调 `list_knowledge_bases()`
+2. **检索**：调 `search_knowledge_base(query, kb=...)`，query 要包含核心关键词
+3. **检查结果**：
+   - 没找到 → 换关键词重试 1 次，或老实告诉用户"知识库没有这方面内容"
+   - 相关度 < 0.5 → 提醒用户结果可能不够精确
+4. **综合回答**：基于片段写答案，**每个论点后必须标 [来源：xxx.pdf]**
+
+## 输出规范
+- 答案开头一句话给结论
+- 引用必须明确：`根据《产品手册》第 X 章，... [来源: docs/manual.pdf]`
+- 不要把检索到的片段原文复制粘贴，要总结提炼
+- 检索到的内容和你已知冲突时，**优先相信知识库**
+
+## 禁止
+- ❌ 不要在没检索的情况下凭记忆回答内部问题
+- ❌ 不要编造 source 路径
+- ❌ 不要把超过 3 个片段的全文都列出来，会刷屏
+```
+
+#### 14.5.7 CLI 导入脚本（`scripts/ingest.py`）
+
+```python
+"""批量导入文档到知识库。用法：python scripts/ingest.py <kb_name> <dir>"""
+import sys
+from pathlib import Path
+from rag.pipeline import ingest_document
+
+def main():
+    if len(sys.argv) < 3:
+        print("用法: python scripts/ingest.py <kb_name> <dir_or_file>")
+        sys.exit(1)
+    kb_name, target = sys.argv[1], sys.argv[2]
+    p = Path(target)
+    files = [p] if p.is_file() else [f for f in p.rglob("*")
+             if f.suffix.lower() in (".pdf", ".md", ".txt", ".docx", ".html")]
+    total = 0
+    for f in files:
+        try:
+            n = ingest_document(str(f), kb=kb_name)
+            print(f"✅ {f.name}: {n} chunks")
+            total += n
+        except Exception as e:
+            print(f"❌ {f.name}: {e}")
+    print(f"\n完成：共导入 {total} 个 chunk 到知识库 [{kb_name}]")
+
+if __name__ == "__main__":
+    main()
+```
+
+使用：
+```bash
+# 导入整个目录
+python scripts/ingest.py product data/docs/产品文档/
+
+# 导入单个文件
+python scripts/ingest.py internal data/docs/规章制度.pdf
+```
+
+### 14.6 进阶能力（按 ROI 排序）
+
+| # | 能力 | 价值 | 代价 |
+|---|---|---|---|
+| 1 | **Rerank** | 检索准确率 +15~30% | 加 BGE-reranker，2GB 显存或 API 调用 |
+| 2 | **多查询改写**（Multi-Query / HyDE） | 召回率 +20% | LLM 多 1~2 次调用 |
+| 3 | **元数据过滤** | 精确性 + 权限隔离 | meta 标记一下即可 |
+| 4 | **混合检索**（向量 + BM25） | 长尾问题 +10% | 加 `rank_bm25` 库 |
+| 5 | **引用高亮**（前端展示原文位置） | 用户信任 ↑↑ | UI 加一段 JS |
+| 6 | **Embedding 升级**（BGE-large-zh / m3） | 中文场景 +20% | 换模型 |
+| 7 | **上下文压缩**（LLMLingua） | 长文档省 token | 多一次 LLM 调用 |
+| 8 | **Self-RAG / Corrective RAG** | 自我纠错 | 复杂度提升 |
+
+#### 14.6.1 Rerank 实现示例
+
+```python
+# rag/retriever.py
+def rerank(query: str, hits: list[dict], top_k: int = 5) -> list[dict]:
+    """用 BGE-reranker 重排，对 top 20 召回精排到 top 5。"""
+    from sentence_transformers import CrossEncoder
+    model = CrossEncoder("BAAI/bge-reranker-base")
+    pairs = [(query, h["text"]) for h in hits]
+    scores = model.predict(pairs)
+    for h, s in zip(hits, scores):
+        h["rerank_score"] = float(s)
+    return sorted(hits, key=lambda x: x["rerank_score"], reverse=True)[:top_k]
+```
+
+调用链：`search(k=20)` → `rerank(top_k=5)` → 返回给 LLM。
+
+#### 14.6.2 多查询改写
+
+```python
+# rag/retriever.py
+def expand_queries(question: str, n: int = 3) -> list[str]:
+    """让 LLM 把一个问题改写成 n 个角度的检索 query，提升召回。"""
+    from llm import chat_with_retry
+    prompt = f"用 {n} 种不同的关键词表达，把下面的问题改写成检索 query：\n问题：{question}"
+    resp = chat_with_retry([{"role": "user", "content": prompt}])
+    return resp.choices[0].message.content.strip().splitlines()[:n]
+
+
+def multi_query_search(question: str, kb: str, k: int = 5) -> list[dict]:
+    """对多个改写后的 query 分别检索，去重合并。"""
+    seen = set()
+    merged = []
+    for q in [question] + expand_queries(question):
+        for hit in search(q, kb=kb, k=k):
+            key = hit["text"][:100]
+            if key not in seen:
+                seen.add(key)
+                merged.append(hit)
+    return sorted(merged, key=lambda x: x["score"], reverse=True)[:k]
+```
+
+### 14.7 评估（`rag/evaluator.py`）
+
+**没有评估的 RAG = 拍脑袋调参**。准备 50~100 条标注 QA 对（`data/eval/qa.jsonl`）：
+
+```jsonl
+{"question": "产品支持哪些支付方式？", "expected_sources": ["docs/product.md"], "expected_keywords": ["微信", "支付宝"]}
+{"question": "如何退款？", "expected_sources": ["docs/policy.md"], "expected_keywords": ["7天", "原路返回"]}
+```
+
+```python
+# rag/evaluator.py
+import json
+from .pipeline import query
+
+def eval_recall_at_k(qa_file: str, kb: str, k: int = 5) -> dict:
+    """计算 Recall@k 与 source 命中率。"""
+    total, source_hit, keyword_hit = 0, 0, 0
+    for line in open(qa_file, encoding="utf-8"):
+        qa = json.loads(line)
+        hits = query(qa["question"], kb=kb, k=k)
+        total += 1
+        # source 命中
+        sources = {h["source"] for h in hits}
+        if any(es in s for es in qa.get("expected_sources", []) for s in sources):
+            source_hit += 1
+        # 关键词命中
+        joined = " ".join(h["text"] for h in hits)
+        if all(kw in joined for kw in qa.get("expected_keywords", [])):
+            keyword_hit += 1
+    return {
+        "total": total,
+        "source_recall@k": round(source_hit / total, 3),
+        "keyword_recall@k": round(keyword_hit / total, 3),
+    }
+```
+
+跑评估：
+```bash
+python -c "from rag.evaluator import eval_recall_at_k; \
+  print(eval_recall_at_k('data/eval/qa.jsonl', kb='product', k=5))"
+# {'total': 50, 'source_recall@k': 0.84, 'keyword_recall@k': 0.72}
+```
+
+**调参循环**：改 chunk_size / overlap / k / 是否 rerank → 跑评估 → 看数字 → 继续调。
+
+### 14.8 测试套件（`tests/test_rag.py`）
+
+复用现有 mock 套路，**完全离线**：
+
+```python
+import os, tempfile, unittest
+
+class RagTest(unittest.TestCase):
+    def setUp(self):
+        # 用临时目录 + hash embedding，避免污染真实库
+        self.tmp = tempfile.mkdtemp()
+        os.environ["RAG_DB_PATH"] = self.tmp
+        os.environ["EMBED_PROVIDER"] = "hash"
+
+    def test_chunk_text_normal(self):
+        from rag.chunker import chunk_text
+        text = "句一。句二。" * 100
+        chunks = chunk_text(text, size=100, overlap=20)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 120 for c in chunks))  # size + overlap
+
+    def test_ingest_and_search(self):
+        from rag.store import ingest, search
+        ingest("Python 是一种解释型语言", {"source": "test.md"}, kb="test")
+        ingest("Java 是一种编译型语言", {"source": "test.md"}, kb="test")
+        hits = search("Python 特性", kb="test", k=2)
+        self.assertGreater(len(hits), 0)
+        self.assertIn("Python", hits[0]["text"])
+
+    def test_multi_kb_isolation(self):
+        from rag.store import ingest, search
+        ingest("产品 A 是手机", {"source": "a.md"}, kb="prod")
+        ingest("公司规定", {"source": "b.md"}, kb="policy")
+        self.assertEqual(len(search("手机", kb="policy")), 0)
+        self.assertGreater(len(search("手机", kb="prod")), 0)
+```
+
+### 14.9 配置项扩展
+
+`.env` 追加：
+```bash
+# RAG 配置
+RAG_DB_PATH=./chroma_store           # 复用 long_term 的 chroma 目录也可
+RAG_DEFAULT_KB=default               # 不指定 kb 时的默认库
+RAG_CHUNK_SIZE=500                   # 默认分段大小
+RAG_CHUNK_OVERLAP=50                 # 默认重叠
+RAG_MIN_SCORE=0.3                    # 检索阈值（低于直接过滤）
+RAG_TOP_K=5                          # 默认返回片段数
+
+# 可选：rerank
+RAG_ENABLE_RERANK=0                  # 1 启用
+RAG_RERANK_MODEL=BAAI/bge-reranker-base
+```
+
+### 14.10 RAG 开发 Todo 清单
+
+#### 🚀 R1 — 最小可用 RAG（1 天）
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 1 | `rag/chunker.py` | 按句子边界 + overlap 切分 |
+| 2 | `rag/loaders.py` | 至少支持 .md / .txt / .pdf |
+| 3 | `rag/store.py` | 多知识库 collection + 引用元数据 |
+| 4 | `rag/pipeline.py` | ingest_document / query 端到端 |
+| 5 | `tools.py` 注册 `search_knowledge_base` | 标准 JSON Schema |
+| 6 | `skills/rag-assistant/SKILL.md` | 教 LLM 何时调、怎么引用 |
+| 7 | `scripts/ingest.py` | CLI 批量导入 |
+| 8 | 准备一份测试知识库 | 几个 .md，验证端到端跑通 |
+
+**完成标志**：CLI 导入文档后，Agent 能基于文档回答 + 标来源。
+
+#### 🎯 R2 — 生产可用（3~5 天）
+
+| # | 任务 | 关键点 |
+|---|---|---|
+| 9 | 元数据过滤 | 按部门 / 时间 / 文档类型 |
+| 10 | Rerank 接入 | BGE-reranker-base，可配置开关 |
+| 11 | 评估集（`data/eval/qa.jsonl`） | 50~100 条标注 QA |
+| 12 | `rag/evaluator.py` | Recall@k / Source 命中率 |
+| 13 | Web UI 引用展示 | 点击来源能看原文 |
+| 14 | `tests/test_rag.py` | 离线单测 ≥ 5 个用例 |
+
+**完成标志**：评估 Recall@5 ≥ 0.8，前端能看见引用，CI 跑通。
+
+#### ⚡ R3 — 进阶能力（按需）
+
+| # | 任务 | 收益 |
+|---|---|---|
+| 15 | 多查询改写（Multi-Query / HyDE） | 召回率 +20% |
+| 16 | 混合检索（向量 + BM25） | 长尾 +10% |
+| 17 | Embedding 升级（BGE-m3 / large-zh） | 中文 +20% |
+| 18 | 上下文压缩（LLMLingua） | 长文档省 token |
+| 19 | Self-RAG / Corrective RAG | 自我纠错 |
+| 20 | 增量索引 / 文档去重 | 多次导入不膨胀 |
+
+### 14.11 与现有 Skill / Tool 系统的协作图
+
+```
+用户："我们产品支持哪些支付方式？"
+                ↓
+LLM 看 system prompt 里的 skill 索引
+                ↓
+匹配到 rag-assistant 的 description（触发词："我们产品"）
+                ↓
+调 activate_skill(name="rag-assistant")
+                ↓
+SKILL.md 正文回灌：教它"先 list_kbs → 再 search → 引用回答"
+                ↓
+LLM 按指令调 search_knowledge_base(query="支付方式", kb="product")
+                ↓
+工具返回：[片段1] [片段2] [片段3]（含 source）
+                ↓
+LLM 综合 + 引用：
+  "根据《产品手册》v2.3，支持三种支付：
+   1. 微信支付 [来源: docs/product.md]
+   2. 支付宝 [来源: docs/product.md]
+   3. 银联快捷 [来源: docs/payment.pdf]"
+```
+
+**核心优势**：Skill 文档化 RAG 使用规范、Tool 是执行入口、长期记忆模块是底层存储——**三层各司其职、零代码冗余**。
+
+### 14.12 上线检查清单
+
+部署 RAG 前确认：
+
+- ✅ 评估集准备好，Recall@k ≥ 0.7
+- ✅ 文档导入幂等（重复导入不膨胀）
+- ✅ 知识库容量监控（Chroma 单 collection > 50 万条要考虑分片）
+- ✅ 敏感文档加 meta 过滤，做权限隔离
+- ✅ 检索失败时 LLM 不编造答案（system prompt 强约束）
+- ✅ 来源链接前端可点击展开原文
+- ✅ 文档更新流程：版本号 + 自动重新索引
+- ✅ 检索日志记录 query 与命中率，用于持续优化
+
+---
+
+完成 §十四 后，整个开发文档覆盖了 **Agent 基座 + Skill 能力包 + RAG 知识库** 三大支柱，构成了完整的 LLM 应用工程参考。
+
+
+
