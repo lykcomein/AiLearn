@@ -38,6 +38,7 @@ from memory import SessionStore, ShortTermMemory  # noqa: E402
 from memory import long_term  # noqa: E402
 from prompts import CURRENT as SYSTEM_PROMPT  # noqa: E402
 from tools import TOOL_MAP, TOOLS, safe_call  # noqa: E402
+from skill_loader import activate_skill, parse_skill_command  # noqa: E402
 
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
 SHORT_TERM_TURNS = int(os.getenv("SHORT_TERM_TURNS", "10"))
@@ -78,6 +79,17 @@ def _run_once(session_id: str, user_input: str):
     from concurrent.futures import ThreadPoolExecutor
 
     mem = _build_memory_for(session_id)
+
+    parsed = parse_skill_command(user_input)
+    if parsed:
+        skill_name, remaining = parsed
+        body = activate_skill(skill_name)
+        mem.add({"role": "system", "content": body})
+        if not remaining:
+            confirm = f"已加载技能: {skill_name}"
+            trace = [{"type": "final", "content": confirm}]
+            return confirm, trace
+        user_input = remaining
     user_msg = {"role": "user", "content": user_input}
     mem.add(user_msg)
     _store.append(session_id, user_msg)
@@ -196,6 +208,13 @@ def list_sessions():
 def delete_session(sid: str):
     n = _store.delete(sid)
     return {"deleted": n}
+
+
+@app.get("/api/skills")
+def list_skills_api():
+    from skill_loader import load_skills
+    skills = load_skills()
+    return [{"name": s.name, "description": s.description} for s in sorted(skills.values(), key=lambda s: s.name)]
 
 
 @app.get("/api/health")

@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from llm import chat_with_retry
 from memory import SessionStore, ShortTermMemory, long_term
 from prompts import CURRENT as SYSTEM_PROMPT
+from skill_loader import activate_skill, parse_skill_command
 from tools import TOOL_MAP, TOOLS, safe_call
 
 load_dotenv()
@@ -166,5 +167,16 @@ if __name__ == "__main__":
             break
         if not q:
             continue
+
+        parsed = parse_skill_command(q)
+        if parsed:
+            skill_name, remaining = parsed
+            body = activate_skill(skill_name)
+            short_mem.add({"role": "system", "content": body})
+            print(f"\n[已加载技能: {skill_name}]")
+            if not remaining:
+                continue
+            q = remaining
+
         ans = run(q)
         print(f"\nAgent: {ans}")

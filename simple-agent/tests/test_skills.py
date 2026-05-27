@@ -22,6 +22,7 @@ from skill_loader import (  # noqa: E402
     activate_skill,
     build_skill_index_prompt,
     load_skills,
+    parse_skill_command,
 )
 
 
@@ -106,6 +107,28 @@ class SkillLoaderTest(unittest.TestCase):
 
     def test_build_index_prompt_empty(self) -> None:
         self.assertEqual(build_skill_index_prompt({}), "")
+
+    # ---------- parse_skill_command ----------
+    def test_parse_skill_command_valid(self) -> None:
+        self._write_skill("demo", "---\nname: demo\ndescription: x\n---\n正文")
+        result = parse_skill_command("/demo", self.skills_dir)
+        self.assertIsNotNone(result)
+        self.assertEqual(result, ("demo", ""))
+
+    def test_parse_skill_command_with_message(self) -> None:
+        self._write_skill("demo", "---\nname: demo\ndescription: x\n---\n正文")
+        result = parse_skill_command("/demo 帮我分析数据", self.skills_dir)
+        self.assertIsNotNone(result)
+        self.assertEqual(result, ("demo", "帮我分析数据"))
+
+    def test_parse_skill_command_unknown_skill(self) -> None:
+        self._write_skill("demo", "---\nname: demo\ndescription: x\n---\n正文")
+        result = parse_skill_command("/not-exist", self.skills_dir)
+        self.assertIsNone(result)
+
+    def test_parse_skill_command_not_a_command(self) -> None:
+        result = parse_skill_command("普通消息", self.skills_dir)
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

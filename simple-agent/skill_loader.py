@@ -134,6 +134,34 @@ def activate_skill(name: str, skills_dir: str | None = None) -> str:
         return f"[skill 读取失败] {name}: {e}"
 
 
+def parse_skill_command(user_input: str, skills_dir: str | None = None) -> tuple[str, str] | None:
+    """
+    解析 /skill_name 命令。
+
+    Args:
+        user_input: 用户原始输入，如 "/csv-analyzer 分析数据"
+
+    Returns:
+        匹配到已注册的 skill 时返回 (skill_name, remaining_message)，否则返回 None。
+    """
+    stripped = user_input.strip()
+    if not stripped.startswith("/"):
+        return None
+
+    parts = stripped[1:].split(None, 1)
+    if not parts:
+        return None
+
+    name = parts[0]
+    remaining = parts[1] if len(parts) > 1 else ""
+
+    index = load_skills(skills_dir)
+    if name not in index:
+        return None
+
+    return name, remaining
+
+
 def build_skill_index_prompt(skills: dict[str, SkillMeta]) -> str:
     """
     构造注入 system prompt 的 skill 列表，每个 skill 一行。

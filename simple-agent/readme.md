@@ -248,9 +248,10 @@ simple-agent/
 | 会话持久化 | [`memory/session_store.py`](memory/session_store.py) | SQLite，按 `session_id` 存取，跨重启恢复 |
 | 长期向量记忆 | [`memory/long_term.py`](memory/long_term.py) | Chroma，按需召回 + 启发式写入 |
 | Prompt 版本管理 | [`prompts.py`](prompts.py) | `v1`/`v2`/`current`，便于 A/B 测试 |
-| Web API | [`web/server.py`](web/server.py) | REST + SSE，多会话隔离 |
-| 流式 UI | [`web/static/index.html`](web/static/index.html) | Markdown 渲染、代码高亮、暗色主题、抽屉响应式 |
-| 测试 | `tests/` | 39 用例完全离线，<200ms |
+| Skill 命令激活 | [`skill_loader.py`](skill_loader.py) | `/skill_name` 命令解析 + Web 选择器 UI |
+| Web API | [`web/server.py`](web/server.py) | REST + SSE，多会话隔离，`/api/skills` 列表 |
+| 流式 UI | [`web/static/index.html`](web/static/index.html) | Markdown 渲染、代码高亮、暗色主题、Skill 选择器 |
+| 测试 | `tests/` | 53 用例完全离线，<200ms |
 
 下面按"模块"分组逐文件详解。
 
@@ -451,6 +452,7 @@ def safe_call(name, fn, **kwargs) -> str:
 | `GET` | `/` | 返回聊天 UI（`static/index.html`） |
 | `POST` | `/api/chat` | 同步对话，返回 `{session_id, answer, trace}` |
 | `POST` | `/api/chat/stream` | SSE 流式，逐事件推送 trace |
+| `GET` | `/api/skills` | 返回可用 skill 列表 `[{name, description}]` |
 | `GET` | `/api/sessions` | 列出所有持久化会话 |
 | `DELETE` | `/api/sessions/{sid}` | 删除指定会话 |
 | `GET` | `/api/health` | 探活 + 返回 long_term/MAX_STEPS 等配置 |
@@ -733,7 +735,46 @@ description: 当用户需要分析 CSV 文件、统计数据分布、查找异�
   调 read_file("sales.csv") 或反问用户路径
 ```
 
-### 7.5 添加一个新 Skill（3 步）
+### 7.5 用户主动激活 Skill（命令模式）
+
+除了 LLM 自动判断外，用户还可以通过 `/skill_name` 命令**主动激活**指定 skill：
+
+**CLI 模式**：
+```bash
+> /csv-analyzer
+[已加载技能: csv-analyzer]
+
+> 帮我分析 sales.csv
+🤖 （按 CSV 分析技能指令执行）
+```
+
+也支持一步到位（命令 + 消息）：
+```bash
+> /csv-analyzer 帮我分析 sales.csv 的数据分布
+[已加载技能: csv-analyzer]
+🤖 （直接按技能指令处理）
+```
+
+**Web 模式**：
+- 输入框上方有 **「🧩 技能」** 按钮
+- 点击按钮弹出 skill 列表面板（可滑动浏览）
+- 每项显示 skill 名称 + 描述，点击选中
+- 选中后输入消息发送，skill 自动生效
+- 也可以在输入框中直接输入 `/csv-analyzer 分析数据`
+
+**工作原理**：
+1. `skill_loader.parse_skill_command(user_input)` 检测是否以 `/` 开头且匹配已注册 skill
+2. 匹配到 → 调用 `activate_skill()` 获取完整正文 → 作为 system 消息注入短期记忆
+3. 后续 LLM 调用时自动看到 skill 指令，按其要求行事
+
+**Web API**：
+```bash
+# 获取可用 skill 列表（前端渲染选择器用）
+curl http://localhost:8000/api/skills
+# 返回：[{"name":"csv-analyzer","description":"..."},...]
+```
+
+### 7.6 添加一个新 Skill（3 步）
 
 ```bash
 # Step 1：建目录与 SKILL.md
@@ -757,7 +798,7 @@ python -c "from skill_loader import load_skills; print(list(load_skills().keys()
 
 无需改任何 Python 代码——**纯文件驱动**。
 
-### 7.6 与工具系统的关系
+### 7.7 与工具系统的关系
 
 | 维度 | Tool（工具） | Skill（技能） |
 |---|---|---|
@@ -769,16 +810,19 @@ python -c "from skill_loader import load_skills; print(list(load_skills().keys()
 
 **两者协作**：skill 在正文里告诉 LLM「先调 tool A，再调 tool B」，把工具的串联策略文档化。
 
-### 7.7 核心代码导览
+### 7.8 核心代码导览
 
 | 文件 | 作用 |
 |---|---|
-| [`skill_loader.py`](skill_loader.py) | 扫描 `skills/`、解析 frontmatter、构建索引、提供 `activate_skill()` |
+| [`skill_loader.py`](skill_loader.py) | 扫描 `skills/`、解析 frontmatter、构建索引、提供 `activate_skill()` 和 `parse_skill_command()` |
 | [`prompts.py`](prompts.py) | `_build_v2_with_skills()` 自动把 skill 索引追加进 system prompt |
 | [`tools.py`](tools.py) | 注册 `activate_skill` 工具，转发到 `skill_loader.activate_skill` |
-| [`tests/test_skills.py`](tests/test_skills.py) | 10 个测试覆盖扫描、解析、激活、错误兜底 |
+| [`agent.py`](agent.py) | CLI 入口支持 `/skill_name` 命令解析与注入 |
+| [`web/server.py`](web/server.py) | Web 入口支持 `/skill_name` 命令 + `GET /api/skills` 接口 |
+| [`web/static/index.html`](web/static/index.html) | 前端 skill 选择器 UI（按钮 + 弹出面板） |
+| [`tests/test_skills.py`](tests/test_skills.py) | 14 个测试覆盖扫描、解析、激活、命令解析、错误兜底 |
 
-### 7.8 最佳实践
+### 7.9 最佳实践
 
 - **description 写"何时使用"，不要写"是什么"**——LLM 看的是触发条件
   - ❌ `description: 一个 SQL 工具`
@@ -788,7 +832,7 @@ python -c "from skill_loader import load_skills; print(list(load_skills().keys()
 - **References 资料按需引**：体积大的速查表/规范放 `references/` 子目录，正文中只提"必要时查 X"
 - **粒度别太细**：一个 skill 解决一类问题就够，过细会让 LLM 选择困难
 
-### 7.9 排错
+### 7.10 排错
 
 | 现象 | 原因 |
 |---|---|

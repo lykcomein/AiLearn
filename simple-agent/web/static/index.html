@@ -249,6 +249,39 @@ textarea {
 }
 .chip:hover { border-color: var(--primary); color: var(--primary); }
 
+/* Skill 选择栏 */
+.skill-bar {
+  max-width: 780px; margin: 0 auto 8px; position: relative;
+}
+.skill-toggle {
+  padding: 5px 12px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--panel); cursor: pointer; font-size: 12px; color: var(--text-2);
+  transition: .15s; user-select: none; display: inline-flex; align-items: center; gap: 4px;
+}
+.skill-toggle:hover { border-color: var(--primary); color: var(--primary); }
+.skill-toggle.has-active { border-color: var(--primary); color: var(--primary); }
+.skill-toggle .arrow { font-size: 10px; transition: transform .2s; }
+.skill-toggle.open .arrow { transform: rotate(180deg); }
+.skill-panel {
+  display: none; position: absolute; bottom: 100%; left: 0; right: 0;
+  margin-bottom: 6px; padding: 8px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); z-index: 10;
+  max-height: 200px; overflow-y: auto; overflow-x: hidden;
+}
+.skill-panel.open { display: block; }
+.skill-panel::-webkit-scrollbar { width: 4px; }
+.skill-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.skill-item {
+  padding: 8px 12px; border-radius: 8px; cursor: pointer;
+  display: flex; flex-direction: column; gap: 2px; transition: .1s;
+}
+.skill-item:hover { background: var(--panel-2); }
+.skill-item.active { background: var(--primary); color: #fff; }
+.skill-item .skill-name { font-size: 13px; font-weight: 500; }
+.skill-item .skill-desc { font-size: 11px; color: var(--text-2); line-height: 1.3; }
+.skill-item.active .skill-desc { color: rgba(255,255,255,.75); }
+
 /* 空状态 */
 .empty {
   max-width: 560px; margin: 60px auto 0; text-align: center; color: var(--text-2);
@@ -340,6 +373,10 @@ body.sidebar-collapsed aside {
   <div id="log"></div>
 
   <div class="composer">
+    <div class="skill-bar" id="skillBar">
+      <button class="skill-toggle" id="skillToggle">🧩 技能 <span class="arrow">▲</span></button>
+      <div class="skill-panel" id="skillPanel"></div>
+    </div>
     <div class="composer-inner">
       <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
       <button class="send-btn" id="sendBtn" title="发送 (Enter)">
@@ -599,6 +636,18 @@ async function send() {
   input.value = ''; autoGrow();
   isSending = true; sendBtn.disabled = true;
 
+  // 拼接 skill 前缀
+  const message = activeSkill ? `/${activeSkill} ${text}` : text;
+
+  // 清除 skill 选中状态
+  if (activeSkill) {
+    activeSkill = null;
+    skillToggle.classList.remove('has-active');
+    skillToggle.innerHTML = '🧩 技能 <span class="arrow">▲</span>';
+    input.placeholder = DEFAULT_PLACEHOLDER;
+    renderSkillPanel();
+  }
+
   createMsg('user', text);
   const asstMd = createMsg('assistant', '', { streaming: true });
   currentAssistant = asstMd;
@@ -609,7 +658,7 @@ async function send() {
     const resp = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, session_id: sessionId }),
+      body: JSON.stringify({ message: message, session_id: sessionId }),
     });
     if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
 
@@ -701,11 +750,77 @@ $('backdrop').onclick = () => {
 })();
 
 /* ============================================
+ * Skill 选择器
+ * ============================================ */
+let activeSkill = null;
+const skillBar = $('skillBar');
+const skillToggle = $('skillToggle');
+const skillPanel = $('skillPanel');
+const DEFAULT_PLACEHOLDER = '输入消息，Enter 发送，Shift+Enter 换行';
+let skillsList = [];
+
+async function loadSkills() {
+  try {
+    const res = await fetch('/api/skills');
+    skillsList = await res.json();
+    if (!skillsList.length) { skillBar.style.display = 'none'; return; }
+    renderSkillPanel();
+  } catch (e) {
+    console.error('加载 skills 失败', e);
+    skillBar.style.display = 'none';
+  }
+}
+
+function renderSkillPanel() {
+  skillPanel.innerHTML = '';
+  skillsList.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'skill-item' + (activeSkill === s.name ? ' active' : '');
+    item.innerHTML = `<span class="skill-name">${escapeHTML(s.name)}</span><span class="skill-desc">${escapeHTML(s.description)}</span>`;
+    item.onclick = () => selectSkill(s.name);
+    skillPanel.appendChild(item);
+  });
+}
+
+function selectSkill(name) {
+  if (activeSkill === name) {
+    activeSkill = null;
+    input.placeholder = DEFAULT_PLACEHOLDER;
+    skillToggle.classList.remove('has-active');
+    skillToggle.innerHTML = '🧩 技能 <span class="arrow">▲</span>';
+  } else {
+    activeSkill = name;
+    input.placeholder = `已加载 ${name}，请输入任务…`;
+    skillToggle.classList.add('has-active');
+    skillToggle.innerHTML = `🧩 ${escapeHTML(name)} <span class="arrow">▲</span>`;
+  }
+  closeSkillPanel();
+  renderSkillPanel();
+  input.focus();
+}
+
+function toggleSkillPanel() {
+  const isOpen = skillPanel.classList.toggle('open');
+  skillToggle.classList.toggle('open', isOpen);
+}
+
+function closeSkillPanel() {
+  skillPanel.classList.remove('open');
+  skillToggle.classList.remove('open');
+}
+
+skillToggle.onclick = (e) => { e.stopPropagation(); toggleSkillPanel(); };
+document.addEventListener('click', (e) => {
+  if (!skillBar.contains(e.target)) closeSkillPanel();
+});
+
+/* ============================================
  * 初始化
  * ============================================ */
 if (sessionId) sidChip.textContent = 'session: ' + sessionId;
 renderEmpty();
 refreshSessions();
+loadSkills();
 input.focus();
 </script>
 </body>
